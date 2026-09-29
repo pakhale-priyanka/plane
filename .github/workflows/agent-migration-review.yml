@@ -1,0 +1,97 @@
+name: Agent migration review
+
+# The same analysis as agent-migration-gate.yml, run through the official
+# anthropics/claude-code-action instead of driving the CLI directly.
+#
+# The difference is deliberate and is the point of having both:
+#
+#   agent-migration-gate.yml   blocking.  Raw CLI, read-only tools, structured
+#                              output, exit code decided by our own script. The
+#                              repository owns the policy.
+#   agent-migration-review.yml advisory.  Managed action: it authenticates, posts
+#                              and updates a sticky pull-request comment, and can
+#                              be summoned by a human with a trigger phrase. The
+#                              action owns the plumbing.
+#
+# A merge gate should be the first. A reviewer's second opinion should be the
+# second. Running both means a risky migration is blocked *and* explained.
+
+on:
+  pull_request:
+    branches: ["preview", "canary", "master"]
+    types: ["opened", "synchronize", "reopened", "ready_for_review"]
+    paths:
+      - "apps/api/**/migrations/**.py"
+  issue_comment:
+    types: ["created"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  review:
+    name: migration review (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Only act on a comment that actually summons the agent, otherwise every
+    # comment on every pull request would start a run.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '@claude review migrations'))
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Claude migration review
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        continue-on-error: true      # advisory: never blocks the merge
+        with:
+          # Either credential works; the action picks up whichever is set.
+          # claude setup-token mints the OAuth one from a Claude subscription,
+          # which avoids needing a separate Console account with credits.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          trigger_phrase: "@claude review migrations"
+          use_sticky_comment: true   # update one comment instead of adding more
+          prompt: |
+            Follow .github/agent/migration-safety.prompt.md exactly.
+            Review only the Django migrations this pull request adds or modifies
+            under apps/api/**/migrations/. Answer in the schema given below.
+          claude_args: >-
+            --model claude-sonnet-5
+            --allowedTools Read Grep Glob
+            --json-schema .github/agent/migration-safety.schema.json
+
+      - name: Surface the structured verdict
+        if: always()
+        env:
+          # claude-code-action@v1 exposes: branch_name, execution_file,
+          # github_token, session_id, structured_output. `conclusion` exists on
+          # main but not on the v1 tag — actionlint catches the difference, which
+          # is a good reason to pin the tag and lint against it.
+          OUTCOME: ${{ steps.claude.outcome }}
+          SESSION: ${{ steps.claude.outputs.session_id }}
+          STRUCTURED: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          set -uo pipefail
+          echo "step outcome: ${OUTCOME:-<none>}   session: ${SESSION:-<none>}"
+          # The same gate script reads this, so the two workflows cannot drift
+          # apart in how they read a verdict — only in whether they enforce it.
+          if [ -n "${STRUCTURED:-}" ] && echo "$STRUCTURED" | jq -e . >/dev/null 2>&1; then
+            echo "$STRUCTURED" > /tmp/verdict.json
+            FAIL_ON=critical ON_ERROR=neutral bash .github/agent/gate.sh /tmp/verdict.json || true
+          else
+            echo "::notice::No structured output returned; nothing to report."
+          fi
