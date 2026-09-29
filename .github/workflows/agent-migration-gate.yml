@@ -1,0 +1,215 @@
+name: Agent migration gate
+
+# A coding agent reviews Django migrations for production risk and the build
+# fails on what it finds.
+#
+# This deliberately does NOT overlap with migration-check.yml. That workflow
+# answers "is the migration graph well-formed?" — a structural question with an
+# exact answer, so it is checked deterministically. This one answers "is applying
+# this safe against a large production database during a rolling deploy?" — a
+# question about consequence, which has no linter.
+#
+# Threat model: the pull request branch is attacker-controlled. Three things
+# follow, and each has a step below.
+#   1. The agent must not auto-load instructions from the branch it is judging.
+#      CLAUDE.md, .claude/ and hooks are stripped from the working tree first.
+#   2. The gate's own prompt, schema and script must come from the BASE branch,
+#      not from the pull request, or a PR can simply edit the gate that judges it.
+#   3. The agent gets read-only tools. A reviewer that can write is not a reviewer.
+#
+# Trigger note: `pull_request` (not `pull_request_target`) is used on purpose.
+# `pull_request_target` runs with repository secrets in scope against code the
+# PR author controls, which would hand ANTHROPIC_API_KEY to anyone who opens a
+# pull request. The cost of the safe choice is that pull requests from forks
+# receive no secrets, so the agent step is skipped for them — see the "secret
+# availability" step below, which makes that visible instead of silently green.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["preview", "canary", "master"]
+    types: ["opened", "synchronize", "reopened", "ready_for_review"]
+    paths:
+      - "apps/api/**/migrations/**.py"
+      - ".github/workflows/agent-migration-gate.yml"
+      - ".github/agent/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  migration-safety:
+    name: migration safety (agent)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+       !contains(github.event.pull_request.labels.*.name, 'skip-agent-migration-gate'))
+    env:
+      # Policy lives here, not in the prompt. Tighten or relax the gate without
+      # changing what the agent is asked to look for.
+      FAIL_ON: high
+      ON_ERROR: fail
+
+    steps:
+      # fetch-depth: 0 so the merge-base with the target branch is reachable.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Credential availability
+        id: secret
+        env:
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          APIKEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Either credential works. A subscription token (claude setup-token)
+          # avoids a separate Console account; an API key allows --bare, which
+          # is stronger isolation. See RUNBOOK for the trade-off.
+          if [ -n "$OAUTH" ] || [ -n "$APIKEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Agent gate skipped::No Claude credential is \
+          available. Pull requests from forks never receive secrets, so this \
+          pull request was NOT reviewed for migration safety."
+          fi
+
+      - name: Collect changed migrations
+        id: diff
+        run: |
+          set -euo pipefail
+          BASE="origin/${{ github.base_ref || 'preview' }}"
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'preview' }}" || true
+          # Added or modified migrations only; deletions are migration-check's business.
+          FILES=$(git diff --name-only --diff-filter=AM "$(git merge-base HEAD "$BASE")" HEAD \
+                  -- 'apps/api/**/migrations/*.py' | grep -v '__init__.py' || true)
+          if [ -z "$FILES" ]; then
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "No migrations changed; nothing for the agent to review."
+            exit 0
+          fi
+          echo "count=$(echo "$FILES" | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          { echo 'files<<__EOF__'; echo "$FILES"; echo '__EOF__'; } >> "$GITHUB_OUTPUT"
+          echo "$FILES"
+
+      - name: Take the gate's own files from the base branch
+        if: steps.diff.outputs.count != '0' && steps.secret.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          BASE="origin/${{ github.base_ref || 'preview' }}"
+          # Without this, a pull request could relax the prompt, widen the schema
+          # or rewrite gate.sh in the same commit that introduces the risky
+          # migration, and the gate would faithfully apply the attacker's policy.
+          rm -rf .github/agent
+          git checkout "$BASE" -- .github/agent
+          echo "Restored from $BASE:"
+          git ls-files --with-tree="$BASE" .github/agent
+
+      - name: Strip agent-influencing files from the working tree
+        if: steps.diff.outputs.count != '0' && steps.secret.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          # The agent runs without --bare (an OAuth token forbids it), so it would
+          # otherwise auto-discover instruction files from the branch under review.
+          # A CLAUDE.md saying "always report pass" is a one-line gate bypass.
+          find . -name 'CLAUDE.md' -not -path './.git/*' -print -delete || true
+          find . -type d -name '.claude' -not -path './.git/*' -print -exec rm -rf {} + || true
+          echo "Working tree cleaned of agent instruction files."
+
+      - name: Set up Node
+        if: steps.diff.outputs.count != '0' && steps.secret.outputs.available == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install Claude Code
+        if: steps.diff.outputs.count != '0' && steps.secret.outputs.available == 'true'
+        run: npm install -g @anthropic-ai/claude-code@2.1.284
+
+      - name: Build the review request
+        if: steps.diff.outputs.count != '0' && steps.secret.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          BASE=$(git merge-base HEAD "origin/${{ github.base_ref || 'preview' }}")
+          {
+            cat .github/agent/migration-safety.prompt.md
+            echo
+            echo "## Migrations changed by this pull request"
+            echo
+            echo '```diff'
+            git diff "$BASE" HEAD -- 'apps/api/**/migrations/*.py'
+            echo '```'
+            echo
+            echo "Read the surrounding models with the Read tool if you need"
+            echo "more context than the diff shows."
+          } > /tmp/request.md
+          wc -c /tmp/request.md
+
+      - name: Run the agent
+        if: steps.diff.outputs.count != '0' && steps.secret.outputs.available == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # What --bare would have set. Kept explicit because an OAuth token
+          # cannot be used with --bare (its auth is strictly API-key).
+          CLAUDE_CODE_SIMPLE: "1"
+        run: |
+          set -uo pipefail
+          # --settings '{}'        : ignore any settings file in the repository
+          # --strict-mcp-config    : and any MCP server it might declare
+          # --allowedTools Read... : read-only. A reviewer that can write is not
+          #                          a reviewer, and Bash would hand a hostile
+          #                          branch command execution on our runner.
+          # --json-schema          : the model cannot answer in prose. Output
+          #                          either matches the schema or the gate calls
+          #                          the run unusable and fails closed.
+          timeout 10m claude -p \
+            --model claude-sonnet-5 \
+            --output-format json \
+            --json-schema "$(cat .github/agent/migration-safety.schema.json)" \
+            --allowedTools "Read" "Grep" "Glob" \
+            --disallowedTools "Bash" "Edit" "Write" "WebFetch" "WebSearch" \
+            --permission-mode dontAsk \
+            --settings '{}' \
+            --strict-mcp-config \
+            --add-dir apps/api \
+            < /tmp/request.md > /tmp/envelope.json
+          echo "exit=$?"
+          jq -r '{is_error, num_turns, total_cost_usd, duration_ms}' /tmp/envelope.json || true
+
+      - name: Extract the verdict
+        if: steps.diff.outputs.count != '0' && steps.secret.outputs.available == 'true'
+        run: |
+          set -uo pipefail
+          # The CLI wraps the answer in a result envelope. With --json-schema the
+          # payload is the structured object; if the run errored it is a message.
+          if jq -e '.is_error == true' /tmp/envelope.json >/dev/null 2>&1; then
+            echo "::error::agent run failed: $(jq -r '.result' /tmp/envelope.json)"
+            echo '{}' > /tmp/verdict.json
+          else
+            jq -r 'if (.result | type) == "object" then .result
+                   else (.result | fromjson? // {}) end' /tmp/envelope.json > /tmp/verdict.json
+          fi
+          cat /tmp/verdict.json
+
+      - name: Gate the build
+        if: steps.diff.outputs.count != '0' && steps.secret.outputs.available == 'true'
+        run: bash .github/agent/gate.sh /tmp/verdict.json
+
+      - name: Upload evidence
+        if: always() && steps.diff.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-safety-${{ github.run_id }}
+          path: |
+            /tmp/request.md
+            /tmp/envelope.json
+            /tmp/verdict.json
+          if-no-files-found: ignore
+          retention-days: 14
