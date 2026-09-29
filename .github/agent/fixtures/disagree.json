@@ -1,0 +1,1 @@
+{"verdict":"pass","severity":"low","summary":"Model claims pass but reports a high finding.","findings":[{"file":"m.py","risk":"backwards_incompatible","severity":"high","why":"Adds NOT NULL column old code does not populate."}]}
