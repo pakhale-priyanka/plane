@@ -59,16 +59,37 @@ def test_project_list_query_count(api_client, n_projects):
 
     queries = [q["sql"] for q in ctx.captured_queries]
     seq = [q for q in queries if "issue_sequence" in q.lower()]
+
+    # The previous run recorded rows_returned=null because the payload is not a
+    # bare list. Without knowing how many projects came back, a flat query count
+    # proves nothing — it is equally consistent with a well-optimised endpoint
+    # and with an empty response.
+    data = getattr(resp, "data", None)
+    if isinstance(data, list):
+        returned, shape = len(data), "list"
+    elif isinstance(data, dict):
+        for key in ("results", "grouped_by", "data"):
+            if isinstance(data.get(key), list):
+                returned, shape = len(data[key]), f"dict[{key}]"
+                break
+        else:
+            returned, shape = None, f"dict keys={sorted(data)[:6]}"
+    else:
+        returned, shape = None, type(data).__name__
+
     rec = {
         "endpoint": "/api/workspaces/<slug>/projects/",
         "serializer": "ProjectListSerializer",
-        "rows": n_projects,
+        "rows_seeded": n_projects,
         "status": resp.status_code,
         "total_queries": len(queries),
         "issue_sequence_queries": len(seq),
-        "rows_returned": len(resp.data) if hasattr(resp, "data") and isinstance(resp.data, list) else None,
+        "rows_returned": returned,
+        "payload_shape": shape,
+        "project_table_queries": len([q for q in queries if " projects" in q.lower() or "project\"" in q.lower()]),
     }
     _append(rec)
-    print(f"\n[N+1] projects={n_projects} status={resp.status_code} "
-          f"total_queries={len(queries)} issue_sequence_queries={len(seq)}")
+    print(f"\n[N+1] seeded={n_projects} returned={returned} shape={shape} "
+          f"status={resp.status_code} total_queries={len(queries)} "
+          f"issue_sequence_queries={len(seq)}")
     assert resp.status_code == 200, resp.status_code
