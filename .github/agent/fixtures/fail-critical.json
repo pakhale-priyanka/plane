@@ -1,0 +1,1 @@
+{"verdict":"fail","severity":"critical","summary":"Drops a populated column with no reverse.","findings":[{"file":"apps/api/plane/db/migrations/0093_drop.py","line":18,"risk":"data_loss","severity":"critical","why":"RemoveField on issues.description_html discards production data irrecoverably.","mitigation":"Ship a deprecation release first; drop in a later migration."}]}
