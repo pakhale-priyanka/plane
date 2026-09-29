@@ -1,0 +1,96 @@
+name: Analysis measurements
+
+# Tasks 22, 26 and 28 make claims that static reading cannot support: a query
+# count, reachability evidence, and whether a test would survive its behaviour
+# being deleted. All three need the suite to actually run, against a real
+# Postgres and Redis. This workflow is where those numbers come from.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/analysis-measure.yml"
+      - "apps/api/plane/tests/perf/**"
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: apps/api
+    env:
+      DJANGO_SETTINGS_MODULE: plane.settings.test
+      SECRET_KEY: ci-analysis-measure
+      DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/ci
+      REDIS_URL: redis://127.0.0.1:6379/0
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.x"
+          cache: "pip"
+          cache-dependency-path: "apps/api/requirements/*.txt"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest-cov coverage
+
+      # --- task 22: query counts -------------------------------------------
+      - name: N+1 query counts
+        id: nplus1
+        continue-on-error: true
+        env:
+          NPLUS1_OUT: ${{ github.workspace }}/nplus1_results.json
+        run: pytest plane/tests/perf/test_nplus1.py -p no:cacheprovider -q 2>&1 | tail -40
+
+      # --- tasks 26 and 28: coverage over the whole suite -------------------
+      - name: Full suite with coverage
+        id: cov
+        continue-on-error: true
+        run: |
+          coverage run --rcfile=.coveragerc -m pytest -p no:cacheprovider -q \
+            --ignore=plane/tests/perf 2>&1 | tail -40
+          coverage json -o "${{ github.workspace }}/coverage.json" || true
+          coverage report --skip-covered | tail -25 || true
+
+      - name: Summarise
+        if: always()
+        run: |
+          echo "nplus1 step : ${{ steps.nplus1.outcome }}"
+          echo "coverage step: ${{ steps.cov.outcome }}"
+          ls -la "${{ github.workspace }}"/*.json 2>/dev/null || echo "no result files"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: analysis-measurements
+          path: |
+            nplus1_results.json
+            coverage.json
+          if-no-files-found: warn
+          retention-days: 14
