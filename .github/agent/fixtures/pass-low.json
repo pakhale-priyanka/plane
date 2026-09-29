@@ -1,0 +1,1 @@
+{"verdict":"pass","severity":"low","summary":"Adds an index; table is small.","findings":[{"file":"apps/api/plane/db/migrations/0092_x.py","line":12,"risk":"table_lock","severity":"low","why":"CreateIndex without CONCURRENTLY, but the table has few rows.","mitigation":"Use AddIndexConcurrently if the table grows."}]}
