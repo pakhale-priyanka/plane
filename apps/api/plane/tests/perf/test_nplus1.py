@@ -12,9 +12,9 @@ import json, os, pytest
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 
+from plane.db.models import Project, ProjectMember
 from plane.tests.factories import (
     UserFactory, WorkspaceFactory, WorkspaceMemberFactory,
-    ProjectFactory, ProjectMemberFactory,
 )
 
 OUT = os.environ.get("NPLUS1_OUT", "nplus1_results.json")
@@ -40,9 +40,18 @@ def test_project_list_query_count(api_client, n_projects):
     user = UserFactory()
     ws = WorkspaceFactory(owner=user)
     WorkspaceMemberFactory(workspace=ws, member=user, role=20)
-    for _ in range(n_projects):
-        project = ProjectFactory(workspace=ws)
-        ProjectMemberFactory(project=project, member=user, role=20)
+    # Created through the ORM rather than the factories: ProjectFactory declares
+    # django_get_or_create on (name, workspace), and ProjectMember.save() creates
+    # a ProjectUserProperty row per (user, project) — the combination produced a
+    # duplicate-key error on the unique (user, project) constraint.
+    for i in range(n_projects):
+        project = Project.objects.create(
+            name=f"perf-{n_projects}-{i}", identifier=f"P{n_projects}{i}",
+            workspace=ws, created_by=user, updated_by=user,
+        )
+        ProjectMember.objects.get_or_create(
+            project=project, member=user, defaults={"role": 20, "sort_order": 65535 + i},
+        )
 
     api_client.force_authenticate(user=user)
     with CaptureQueriesContext(connection) as ctx:
