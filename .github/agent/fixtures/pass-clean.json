@@ -1,0 +1,1 @@
+{"verdict":"pass","severity":"none","summary":"Adds one nullable column and a concurrent index. Routine.","findings":[]}
