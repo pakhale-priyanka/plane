@@ -56,6 +56,12 @@ def test_project_list_query_count(api_client, n_projects):
     api_client.force_authenticate(user=user)
     with CaptureQueriesContext(connection) as ctx:
         resp = api_client.get(f"/api/workspaces/{ws.slug}/projects/")
+        # DRF returns a lazy queryset; the serializer does not run until the
+        # response is rendered. Without this the capture window closes before any
+        # per-row query happens, and every endpoint looks flat at 4 queries.
+        if hasattr(resp, "render") and not getattr(resp, "is_rendered", True):
+            resp.render()
+        _ = resp.content
 
     queries = [q["sql"] for q in ctx.captured_queries]
     seq = [q for q in queries if "issue_sequence" in q.lower()]
@@ -64,7 +70,12 @@ def test_project_list_query_count(api_client, n_projects):
     # bare list. Without knowing how many projects came back, a flat query count
     # proves nothing — it is equally consistent with a well-optimised endpoint
     # and with an empty response.
-    data = getattr(resp, "data", None)
+    import json as _json
+    try:
+        body = _json.loads(resp.content.decode() or "null")
+    except Exception:
+        body = None
+    data = body if body is not None else getattr(resp, "data", None)
     if isinstance(data, list):
         returned, shape = len(data), "list"
     elif isinstance(data, dict):
