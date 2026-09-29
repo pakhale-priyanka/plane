@@ -57,8 +57,11 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # requirements.txt is runtime only. pytest-django, factory-boy and the
+          # rest live in requirements/test.txt — without it the suite cannot even
+          # load conftest.py, and coverage silently reports 0%.
           pip install -r requirements.txt
-          pip install pytest-cov coverage
+          pip install -r requirements/test.txt
 
       # --- task 22: query counts -------------------------------------------
       - name: N+1 query counts
