@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "severity", "summary", "findings"],
+  "properties": {
+    "verdict": { "enum": ["pass", "fail"] },
+    "severity": { "enum": ["none", "low", "medium", "high", "critical"] },
+    "summary": { "type": "string", "maxLength": 600 },
+    "findings": {
+      "type": "array",
+      "maxItems": 25,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "risk", "severity", "why"],
+        "properties": {
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "risk": {
+            "enum": ["data_loss", "table_lock", "backwards_incompatible", "irreversible"]
+          },
+          "severity": { "enum": ["low", "medium", "high", "critical"] },
+          "why": { "type": "string", "maxLength": 400 },
+          "mitigation": { "type": "string", "maxLength": 300 }
+        }
+      }
+    }
+  }
+}
