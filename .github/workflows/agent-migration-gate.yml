@@ -156,11 +156,19 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          # What --bare would have set. Kept explicit because an OAuth token
-          # cannot be used with --bare (its auth is strictly API-key).
-          CLAUDE_CODE_SIMPLE: "1"
         run: |
           set -uo pipefail
+          # Do NOT set CLAUDE_CODE_SIMPLE=1 here. It looks like a harmless
+          # "skip discovery" switch, but it is also what --bare uses to pin
+          # authentication to ANTHROPIC_API_KEY, and it makes the CLI ignore an
+          # OAuth token entirely — the run fails with "Not logged in". The
+          # isolation this workflow actually relies on is the two preceding
+          # steps (base-branch policy, stripped instruction files) plus the tool
+          # restrictions below, none of which depend on that variable.
+          #
+          # An empty string still counts as "set" for auth resolution, so an
+          # unused API-key secret must be removed rather than passed through.
+          [ -z "${ANTHROPIC_API_KEY:-}" ] && unset ANTHROPIC_API_KEY || true
           # --settings '{}'        : ignore any settings file in the repository
           # --strict-mcp-config    : and any MCP server it might declare
           # --allowedTools Read... : read-only. A reviewer that can write is not
@@ -179,9 +187,12 @@ jobs:
             --settings '{}' \
             --strict-mcp-config \
             --add-dir apps/api \
-            < /tmp/request.md > /tmp/envelope.json
-          echo "exit=$?"
-          jq -r '{is_error, num_turns, total_cost_usd, duration_ms}' /tmp/envelope.json || true
+            < /tmp/request.md > /tmp/envelope.json || rc=$?
+          # A non-zero exit here must not abort the job: the CLI reports failures
+          # as JSON on stdout, and the gate step turns that into a clear verdict
+          # instead of an opaque "Process completed with exit code 1".
+          echo "claude exit: ${rc:-0}"
+          jq -r '{is_error, num_turns, total_cost_usd, duration_ms, result}' /tmp/envelope.json || true
 
       - name: Extract the verdict
         if: steps.diff.outputs.count != '0' && steps.secret.outputs.available == 'true'
